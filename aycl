@@ -19,10 +19,13 @@ local SNAP_DISTANCE = 13    -- distance used by the one-time snap
 local HEIGHT_OFFSET = 1.5
 local FIELD_OF_VIEW = 50
 
--- Emote save file (executor file functions)
+-- Save files (executor file functions)
 local SAVE_FILE = "EmoteSaves.json"
+local OUTFIT_FILE = "OutfitSaves.json"
+local KEYBIND_FILE = "KeybindSaves.json"
 
--- KEYBINDS: fill with an Enum.KeyCode, or nil to disable
+-- KEYBINDS (defaults): fill with an Enum.KeyCode, or nil to disable.
+-- You can also change these in the Keybinds tab; those changes are saved to KEYBIND_FILE.
 local KEYBINDS = {
     ToggleMinimize = Enum.KeyCode.L, -- show / hide window
     Close = nil,                     -- stop the script completely
@@ -31,7 +34,7 @@ local KEYBINDS = {
 }
 
 -- Window layout
-local WIN_W, WIN_H = 560, 380
+local WIN_W, WIN_H = 560, 480
 local HEADER_H = 64
 local SIDEBAR_W = 140
 
@@ -56,7 +59,20 @@ local CAT_APPEARANCE = "Korblox & Headless"
 local CAT_CATALOG = "Catalog"
 local CAT_EMOTES = "Emotes"
 local CAT_CAMERA = "Camera"
-local CATEGORIES = { CAT_APPEARANCE, CAT_CATALOG, CAT_EMOTES, CAT_CAMERA }
+local CAT_KEYBINDS = "Keybinds"
+local CATEGORIES = { CAT_APPEARANCE, CAT_CATALOG, CAT_EMOTES, CAT_CAMERA, CAT_KEYBINDS }
+
+-- Every keybind action, in the order shown on the Keybinds page
+local KEYBIND_LIST = {
+    { id = "ToggleMinimize", name = "Show / hide window", desc = "Toggle the window" },
+    { id = "Close", name = "Close script", desc = "Stop the script completely" },
+    { id = "CameraSnap", name = "Camera snap", desc = "One-time camera snap" },
+    { id = "CameraLock", name = "Camlock", desc = "Camlock on / off" },
+}
+local KEYBIND_NAMES = {}
+for _, def in ipairs(KEYBIND_LIST) do
+    KEYBIND_NAMES[def.id] = def.name
+end
 
 -- Everything the search bar can find. Add a line here when you add a function.
 local FUNCTIONS = {
@@ -67,9 +83,15 @@ local FUNCTIONS = {
     { name = "Catalog item ID", desc = "Equip accessories or clothing by asset ID", category = CAT_CATALOG,
       keywords = "add hat limited item equip horns input accessory shirt pants tshirt clothes clothing" },
     { name = "Equipped items", desc = "See and remove what your avatar wears", category = CAT_CATALOG,
-      keywords = "original worn current list thumbnail remove rescan" },
+      keywords = "original worn current list thumbnail remove" },
     { name = "Remove all added", desc = "Clear every item you added", category = CAT_CATALOG,
       keywords = "clear delete" },
+    { name = "Reset avatar", desc = "Go back to your original avatar", category = CAT_CATALOG,
+      keywords = "reset restore original default undo rescan" },
+    { name = "Save outfit", desc = "Save your added items under a name", category = CAT_CATALOG,
+      keywords = "outfit save store preset" },
+    { name = "Saved outfits", desc = "Load or delete your saved outfits", category = CAT_CATALOG,
+      keywords = "outfit load apply list favorite preset" },
     { name = "Emote player", desc = "Play any animation by ID", category = CAT_EMOTES,
       keywords = "animation dance play stop id link" },
     { name = "Saved emotes", desc = "Save and replay your emotes", category = CAT_EMOTES,
@@ -78,6 +100,8 @@ local FUNCTIONS = {
       keywords = "snap view zoom fov front" },
     { name = "Camlock", desc = "Fixed camera that tracks your head", category = CAT_CAMERA,
       keywords = "lock track head fixed look" },
+    { name = "Keybinds", desc = "View and change every keybind", category = CAT_KEYBINDS,
+      keywords = "keys hotkey bind rebind shortcut change key" },
 }
 
 local env = (getgenv and getgenv()) or _G
@@ -117,10 +141,71 @@ local headlessRevert = nil
 local savedEmotes = {}  -- { [name] = id }
 local animTrack = nil
 
+-- Outfit state
+local savedOutfits = {}        -- { [name] = { id, id, ... } }
+local originalBackups = {}     -- clones of what the rig was wearing, used by "Reset avatar"
+
 -- Camera state
 local camLocked = false
 local fixedCamPos = nil          -- captured when camlock turns on, never changes while locked
 local camLockSwitchSet = nil     -- lets the V key update the switch in the UI
+
+-- Keybind state
+local DEFAULT_KEYBINDS = {}
+for k, v in pairs(KEYBINDS) do
+    DEFAULT_KEYBINDS[k] = v
+end
+local rebindingId = nil          -- which action is waiting for a key press
+local refreshKeyHints = nil      -- set by the GUI: redraws key buttons and hints
+local keybindStatusSet = nil     -- set by the GUI: writes the Keybinds status line
+
+-- Keybind saving / loading
+
+local function saveKeybinds()
+    pcall(function()
+        if writefile then
+            local data = {}
+            for _, def in ipairs(KEYBIND_LIST) do
+                local k = KEYBINDS[def.id]
+                data[def.id] = k and k.Name or "None"
+            end
+            writefile(KEYBIND_FILE, HttpService:JSONEncode(data))
+        end
+    end)
+end
+
+local function loadKeybinds()
+    local ok, result = pcall(function()
+        if isfile and isfile(KEYBIND_FILE) then
+            return HttpService:JSONDecode(readfile(KEYBIND_FILE))
+        end
+        return {}
+    end)
+    if not (ok and type(result) == "table") then return end
+
+    for _, def in ipairs(KEYBIND_LIST) do
+        local v = result[def.id]
+        if v == "None" then
+            if def.id ~= "ToggleMinimize" then
+                KEYBINDS[def.id] = nil
+            end
+        elseif type(v) == "string" then
+            local okKey, kc = pcall(function() return Enum.KeyCode[v] end)
+            if okKey and kc then
+                KEYBINDS[def.id] = kc
+            end
+        end
+    end
+end
+
+local function resetKeybinds()
+    for _, def in ipairs(KEYBIND_LIST) do
+        KEYBINDS[def.id] = DEFAULT_KEYBINDS[def.id]
+    end
+    saveKeybinds()
+end
+
+loadKeybinds()
 
 -- GUI helpers
 
@@ -516,6 +601,31 @@ local function restoreHidden(entry)
     entry.hidden = {}
 end
 
+-- Attach an accessory or clothing instance to a character (shared by equip and reset)
+local function attachToChar(acc, char, hum)
+    if isClothing(acc) then
+        acc.Parent = char
+        return
+    end
+
+    -- Try the normal route first. AddAccessory can fail without throwing
+    -- (e.g. "Humanoid is not a valid character"), so check the parent afterwards.
+    if hum then
+        pcall(function() hum:AddAccessory(acc) end)
+    end
+    if acc.Parent ~= char then
+        acc.Parent = char
+    end
+
+    -- If the normal attach didn't create a weld, do it by hand
+    local handle = acc:FindFirstChild("Handle")
+    if handle
+        and not handle:FindFirstChildWhichIsA("Weld")
+        and not handle:FindFirstChildWhichIsA("WeldConstraint") then
+        weldAccessory(char, acc)
+    end
+end
+
 -- Attach clones of an entry's items to the given character
 local function equipEntry(entry, char, hum)
     -- remove clones from a previous character/equip
@@ -543,26 +653,9 @@ local function equipEntry(entry, char, hum)
                     end
                 end
             end
-            acc.Parent = char
-        else
-            -- Try the normal route first. AddAccessory can fail without throwing
-            -- (e.g. "Humanoid is not a valid character"), so check the parent afterwards.
-            if hum then
-                pcall(function() hum:AddAccessory(acc) end)
-            end
-            if acc.Parent ~= char then
-                acc.Parent = char
-            end
-
-            -- If the normal attach didn't create a weld, do it by hand
-            local handle = acc:FindFirstChild("Handle")
-            if handle
-                and not handle:FindFirstChildWhichIsA("Weld")
-                and not handle:FindFirstChildWhichIsA("WeldConstraint") then
-                weldAccessory(char, acc)
-            end
         end
 
+        attachToChar(acc, char, hum)
         table.insert(entry.live, acc)
     end
 end
@@ -729,6 +822,65 @@ local function scanOriginals(char)
     return count
 end
 
+-- Keeps a clean copy of everything the rig wears, so "Reset avatar" can bring it back
+local function captureOriginals(char)
+    for _, b in ipairs(originalBackups) do
+        pcall(function() b:Destroy() end)
+    end
+    table.clear(originalBackups)
+    if not char then return end
+
+    for _, child in ipairs(char:GetChildren()) do
+        if not child:GetAttribute(CLONE_ATTR)
+            and (child:IsA("Accessory") or isClothing(child)) then
+            local ok, copy = pcall(function() return child:Clone() end)
+            if ok and copy then
+                table.insert(originalBackups, copy)
+            end
+        end
+    end
+end
+
+-- Back to the original avatar: removes every added item, brings back original
+-- items you removed with X, and refreshes the equipped list.
+-- Returns success, number of original items restored.
+local function resetAvatar()
+    local char = getVisualChar()
+    if not char then
+        return false, 0
+    end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    -- Also un-blanks any original clothing that added items replaced
+    removeAllAdded()
+
+    -- Count which originals are still on the rig
+    local present = {}
+    for _, child in ipairs(char:GetChildren()) do
+        if not child:GetAttribute(CLONE_ATTR)
+            and (child:IsA("Accessory") or isClothing(child)) then
+            local key = child.ClassName .. "|" .. child.Name
+            present[key] = (present[key] or 0) + 1
+        end
+    end
+
+    -- Re-add the ones that are missing
+    local restored = 0
+    for _, backup in ipairs(originalBackups) do
+        local key = backup.ClassName .. "|" .. backup.Name
+        if (present[key] or 0) > 0 then
+            present[key] -= 1
+        else
+            local copy = backup:Clone()
+            attachToChar(copy, char, hum)
+            restored += 1
+        end
+    end
+
+    scanOriginals(char)
+    return true, restored
+end
+
 local function addItemById(id)
     local char = getVisualChar()
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -796,6 +948,54 @@ local function addItemById(id)
     createRow(entry)
     return true, "Added " .. id
 end
+
+-- Outfits (the catalog items you added, saved under a name)
+
+local function loadSavedOutfits()
+    local ok, result = pcall(function()
+        if isfile and isfile(OUTFIT_FILE) then
+            return HttpService:JSONDecode(readfile(OUTFIT_FILE))
+        end
+        return {}
+    end)
+    savedOutfits = (ok and type(result) == "table") and result or {}
+end
+
+local function persistSavedOutfits()
+    pcall(function()
+        if writefile then
+            writefile(OUTFIT_FILE, HttpService:JSONEncode(savedOutfits))
+        end
+    end)
+end
+
+-- IDs of every catalog item currently added, in the order they were added
+local function currentOutfitIds()
+    local ids = {}
+    for _, e in ipairs(entries) do
+        if e.kind == "catalog" then
+            table.insert(ids, tostring(e.id))
+        end
+    end
+    return ids
+end
+
+-- Replaces the currently added items with the outfit's items
+local function applyOutfit(ids)
+    removeAllAdded()
+    local added, failed = 0, 0
+    for _, id in ipairs(ids) do
+        local ok = addItemById(tostring(id))
+        if ok then
+            added += 1
+        else
+            failed += 1
+        end
+    end
+    return added, failed
+end
+
+loadSavedOutfits()
 
 -- Emotes (saved to a file, played on the visible rig)
 
@@ -1003,6 +1203,15 @@ local function closeScript()
     stopEmote()
     camLockSwitchSet = nil
     disableCamLock()
+
+    rebindingId = nil
+    refreshKeyHints = nil
+    keybindStatusSet = nil
+
+    for _, b in ipairs(originalBackups) do
+        pcall(function() b:Destroy() end)
+    end
+    table.clear(originalBackups)
 
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
@@ -1253,8 +1462,10 @@ local function buildGui()
         return p
     end
 
-    -- A function row: name + description on the left, control added on the right
-    local function addRow(page, y, name, desc)
+    -- A function row: name + description on the left, control added on the right.
+    -- Returns the row and its description label.
+    local function addRow(page, y, name, desc, rightPad)
+        rightPad = rightPad or 92
         local row = make("Frame", {
             Position = UDim2.new(0, 14, 0, y),
             Size = UDim2.new(1, -28, 0, 48),
@@ -1264,7 +1475,7 @@ local function buildGui()
         corner(row, UDim.new(0, 8))
         make("TextLabel", {
             Position = UDim2.new(0, 12, 0, 6),
-            Size = UDim2.new(1, -92, 0, 18),
+            Size = UDim2.new(1, -rightPad, 0, 18),
             BackgroundTransparency = 1,
             Text = name,
             TextColor3 = THEME.Text,
@@ -1272,9 +1483,9 @@ local function buildGui()
             TextSize = 13,
             TextXAlignment = Enum.TextXAlignment.Left,
         }, row)
-        make("TextLabel", {
+        local descLabel = make("TextLabel", {
             Position = UDim2.new(0, 12, 0, 25),
-            Size = UDim2.new(1, -92, 0, 16),
+            Size = UDim2.new(1, -rightPad, 0, 16),
             BackgroundTransparency = 1,
             Text = desc,
             TextColor3 = THEME.SubText,
@@ -1283,12 +1494,13 @@ local function buildGui()
             TextXAlignment = Enum.TextXAlignment.Left,
             TextTruncate = Enum.TextTruncate.AtEnd,
         }, row)
-        return row
+        return row, descLabel
     end
 
+    -- Returns the switch setter and the description label
     local function addSwitchRow(page, y, name, desc, initial, onChange)
-        local row = addRow(page, y, name, desc)
-        return createSwitch(row, initial, onChange)
+        local row, descLabel = addRow(page, y, name, desc)
+        return createSwitch(row, initial, onChange), descLabel
     end
 
     ---------------------------------------------------------------- Page: Korblox & Headless
@@ -1334,8 +1546,8 @@ local function buildGui()
     addBtn.LayoutOrder = 1
     local clearBtn = makeButton(catBtnRow, "Remove added", THEME.Danger, UDim2.new(1 / 3, -4, 1, 0))
     clearBtn.LayoutOrder = 2
-    local rescanBtn = makeButton(catBtnRow, "Rescan", THEME.SubText, UDim2.new(1 / 3, -4, 1, 0))
-    rescanBtn.LayoutOrder = 3
+    local resetBtn = makeButton(catBtnRow, "Reset avatar", THEME.SubText, UDim2.new(1 / 3, -4, 1, 0))
+    resetBtn.LayoutOrder = 3
 
     local status = make("TextLabel", {
         Position = UDim2.new(0, 14, 0, 112),
@@ -1349,10 +1561,10 @@ local function buildGui()
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, catalogPage)
 
-    -- Equipped list (bottom of the page): original items first, then added ones
+    -- Equipped list: original items first, then added ones
     listFrame = make("ScrollingFrame", {
         Position = UDim2.new(0, 14, 0, 134),
-        Size = UDim2.new(1, -28, 1, -146),
+        Size = UDim2.new(1, -28, 0, 110),
         BackgroundColor3 = Color3.fromRGB(246, 246, 246),
         BorderSizePixel = 0,
         ScrollBarThickness = 4,
@@ -1375,6 +1587,137 @@ local function buildGui()
     for _, e in ipairs(entries) do
         if not e.row then createRow(e) end
     end
+
+    -- Save outfit (under the equipped items)
+    local outfitName = makeInput(catalogPage, "Outfit name", 252)
+    outfitName.Size = UDim2.new(1, -118, 0, 30)
+    local saveOutfitBtn = makeButton(catalogPage, "Save outfit", THEME.Primary,
+        UDim2.new(0, 84, 0, 30), UDim2.new(1, -98, 0, 252))
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 288),
+        Size = UDim2.new(1, -28, 0, 16),
+        BackgroundTransparency = 1,
+        Text = "Saved outfits",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, catalogPage)
+
+    local outfitList = make("ScrollingFrame", {
+        Position = UDim2.new(0, 14, 0, 306),
+        Size = UDim2.new(1, -28, 1, -318),
+        BackgroundColor3 = Color3.fromRGB(246, 246, 246),
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, catalogPage)
+    corner(outfitList, UDim.new(0, 6))
+    stroke(outfitList, Color3.fromRGB(215, 215, 215), 1)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, outfitList)
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 4),
+        PaddingLeft = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 4),
+    }, outfitList)
+
+    local applyingOutfit = false
+
+    local refreshOutfitList
+    refreshOutfitList = function()
+        for _, c in ipairs(outfitList:GetChildren()) do
+            if c:IsA("Frame") then
+                c:Destroy()
+            end
+        end
+
+        local names = {}
+        for n in pairs(savedOutfits) do
+            table.insert(names, n)
+        end
+        table.sort(names)
+
+        for i, n in ipairs(names) do
+            local ids = savedOutfits[n]
+            if type(ids) == "table" then
+                local row = make("Frame", {
+                    Size = UDim2.new(1, -6, 0, 26),
+                    BackgroundColor3 = Color3.new(1, 1, 1),
+                    BorderSizePixel = 0,
+                    LayoutOrder = i,
+                }, outfitList)
+                corner(row, UDim.new(0, 5))
+                stroke(row, Color3.fromRGB(215, 215, 215), 1)
+
+                local nameBtn = make("TextButton", {
+                    Size = UDim2.new(1, -34, 1, 0),
+                    BackgroundTransparency = 1,
+                    Text = n .. "  ·  " .. #ids .. (#ids == 1 and " item" or " items"),
+                    TextColor3 = THEME.Text,
+                    Font = Enum.Font.Gotham,
+                    TextSize = 12,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                }, row)
+                make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, nameBtn)
+
+                local xBtn = make("TextButton", {
+                    Size = UDim2.new(0, 22, 0, 18),
+                    Position = UDim2.new(1, -26, 0.5, -9),
+                    BackgroundColor3 = THEME.Danger,
+                    Text = "X",
+                    TextColor3 = Color3.new(1, 1, 1),
+                    Font = Enum.Font.GothamBold,
+                    TextSize = 12,
+                    BorderSizePixel = 0,
+                }, row)
+                corner(xBtn, UDim.new(0, 4))
+
+                nameBtn.MouseButton1Click:Connect(function()
+                    if applyingOutfit then return end
+                    applyingOutfit = true
+                    status.Text = "Loading " .. n .. "..."
+                    outfitName.Text = n
+                    local added, failed = applyOutfit(ids)
+                    if failed > 0 then
+                        status.Text = ("Loaded %s: %d added, %d failed"):format(n, added, failed)
+                    else
+                        status.Text = ("Loaded %s (%d items)"):format(n, added)
+                    end
+                    applyingOutfit = false
+                end)
+
+                xBtn.MouseButton1Click:Connect(function()
+                    savedOutfits[n] = nil
+                    persistSavedOutfits()
+                    refreshOutfitList()
+                    status.Text = "Deleted outfit " .. n
+                end)
+            end
+        end
+    end
+
+    refreshOutfitList()
+
+    saveOutfitBtn.MouseButton1Click:Connect(function()
+        local n = outfitName.Text:match("^%s*(.-)%s*$")
+        local ids = currentOutfitIds()
+        if n == "" then
+            status.Text = "Enter an outfit name"
+        elseif #ids == 0 then
+            status.Text = "Add some catalog items first"
+        else
+            savedOutfits[n] = ids
+            persistSavedOutfits()
+            refreshOutfitList()
+            status.Text = ("Saved outfit %s (%d items)"):format(n, #ids)
+        end
+    end)
 
     addBtn.MouseButton1Click:Connect(function()
         status.Text = "Loading..."
@@ -1406,9 +1749,15 @@ local function buildGui()
         status.Text = "Removed all added items"
     end)
 
-    rescanBtn.MouseButton1Click:Connect(function()
-        local n = scanOriginals(getVisualChar())
-        status.Text = ("Found %d original items"):format(n)
+    resetBtn.MouseButton1Click:Connect(function()
+        local ok, restored = resetAvatar()
+        if not ok then
+            status.Text = "No rig found"
+        elseif restored > 0 then
+            status.Text = ("Avatar reset (restored %d original items)"):format(restored)
+        else
+            status.Text = "Avatar reset to original"
+        end
     end)
 
     ---------------------------------------------------------------- Page: Emotes
@@ -1585,13 +1934,14 @@ local function buildGui()
     local cameraPage = newPage(CAT_CAMERA)
     pages[CAT_CAMERA] = cameraPage
 
-    local snapRow = addRow(cameraPage, 44, "Camera snap",
+    local snapRow, snapDesc = addRow(cameraPage, 44, "Camera snap",
         "Move the camera in front of you" .. keyHint(KEYBINDS.CameraSnap))
     local snapBtn = makeButton(snapRow, "Snap", THEME.Primary,
         UDim2.new(0, 64, 0, 26), UDim2.new(1, -76, 0.5, -13))
     snapBtn.MouseButton1Click:Connect(snapCamera)
 
-    camLockSwitchSet = addSwitchRow(cameraPage, 100, "Camlock",
+    local camLockDesc
+    camLockSwitchSet, camLockDesc = addSwitchRow(cameraPage, 100, "Camlock",
         "Fixed camera that tracks your head" .. keyHint(KEYBINDS.CameraLock),
         camLocked, function(on)
             if on then
@@ -1601,6 +1951,75 @@ local function buildGui()
             end
             syncCamSwitch() -- snaps the switch back if camlock could not start
         end)
+
+    ---------------------------------------------------------------- Page: Keybinds
+    local keybindsPage = newPage(CAT_KEYBINDS)
+    pages[CAT_KEYBINDS] = keybindsPage
+
+    local keyButtons = {}
+
+    for i, def in ipairs(KEYBIND_LIST) do
+        local row = addRow(keybindsPage, 44 + (i - 1) * 56, def.name, def.desc, 124)
+        local kb = makeButton(row, "", THEME.Primary,
+            UDim2.new(0, 98, 0, 26), UDim2.new(1, -110, 0.5, -13))
+        keyButtons[def.id] = kb
+
+        kb.MouseButton1Click:Connect(function()
+            if rebindingId == def.id then
+                rebindingId = nil
+                if keybindStatusSet then keybindStatusSet("") end
+            else
+                rebindingId = def.id
+                if keybindStatusSet then
+                    keybindStatusSet("Press a key for " .. def.name .. "  (Esc = cancel, Backspace = unbind)")
+                end
+            end
+            if refreshKeyHints then refreshKeyHints() end
+        end)
+    end
+
+    local keyResetBtn = makeButton(keybindsPage, "Reset to defaults", THEME.SubText,
+        UDim2.new(0, 140, 0, 28), UDim2.new(0, 14, 0, 44 + #KEYBIND_LIST * 56 + 2))
+
+    local keyStatus = make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 44 + #KEYBIND_LIST * 56 + 36),
+        Size = UDim2.new(1, -28, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, keybindsPage)
+
+    keybindStatusSet = function(text)
+        keyStatus.Text = text
+    end
+
+    refreshKeyHints = function()
+        for id, b in pairs(keyButtons) do
+            if rebindingId == id then
+                b.Text = "Press a key..."
+                b.BackgroundColor3 = THEME.Accent
+            else
+                local k = KEYBINDS[id]
+                b.Text = k and k.Name or "None"
+                b.BackgroundColor3 = k and THEME.Primary or THEME.SwitchOff
+            end
+        end
+        snapDesc.Text = "Move the camera in front of you" .. keyHint(KEYBINDS.CameraSnap)
+        camLockDesc.Text = "Fixed camera that tracks your head" .. keyHint(KEYBINDS.CameraLock)
+    end
+
+    keyResetBtn.MouseButton1Click:Connect(function()
+        rebindingId = nil
+        resetKeybinds()
+        refreshKeyHints()
+        keyStatus.Text = "Keybinds reset to defaults"
+    end)
+
+    refreshKeyHints()
 
     ---------------------------------------------------------------- Search results page
     local resultsPage = newPage("Search results")
@@ -1711,6 +2130,13 @@ local function buildGui()
     navigate = function(name, fromHistory)
         currentCategory = name
 
+        -- leaving the Keybinds page cancels a pending rebind
+        if rebindingId then
+            rebindingId = nil
+            keyStatus.Text = ""
+            refreshKeyHints()
+        end
+
         if not fromHistory then
             while #history > histIndex do
                 table.remove(history)
@@ -1771,10 +2197,59 @@ local function buildGui()
     navigate(CAT_APPEARANCE, true)
 end
 
+-- Keybinds
+
+-- Called with the next key pressed while an action is waiting to be rebound
+local function handleRebind(key)
+    local id = rebindingId
+    rebindingId = nil
+    if not id then return end
+
+    local msg
+    if key == Enum.KeyCode.Escape then
+        msg = "Cancelled"
+    elseif key == Enum.KeyCode.Backspace then
+        if id == "ToggleMinimize" then
+            msg = "The window toggle needs a key, or you could not reopen the window"
+        else
+            KEYBINDS[id] = nil
+            saveKeybinds()
+            msg = KEYBIND_NAMES[id] .. " unbound"
+        end
+    elseif key == Enum.KeyCode.Unknown then
+        msg = "That key is not supported"
+    else
+        local conflict
+        for other, k in pairs(KEYBINDS) do
+            if other ~= id and k == key then
+                conflict = other
+            end
+        end
+        if conflict then
+            msg = key.Name .. " is already used by " .. KEYBIND_NAMES[conflict]
+        else
+            KEYBINDS[id] = key
+            saveKeybinds()
+            msg = KEYBIND_NAMES[id] .. " set to " .. key.Name
+        end
+    end
+
+    if keybindStatusSet then keybindStatusSet(msg) end
+    if refreshKeyHints then refreshKeyHints() end
+end
+
 -- Keybinds (ignored while typing in a TextBox)
 
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    -- While rebinding, the next key press is captured instead of triggering anything
+    if rebindingId then
+        handleRebind(input.KeyCode)
+        return
+    end
+
+    if processed then return end
 
     local key = input.KeyCode
     if KEYBINDS.ToggleMinimize and key == KEYBINDS.ToggleMinimize then
@@ -1804,7 +2279,9 @@ local function setup(char)
     headlessRevert = nil
     animTrack = nil
 
-    -- List what the rig is already wearing BEFORE any catalog clones are added
+    -- Keep clean copies of the original items (for "Reset avatar"), then list them,
+    -- BEFORE any catalog clones are added
+    captureOriginals(char)
     scanOriginals(char)
 
     if korbloxOn then
