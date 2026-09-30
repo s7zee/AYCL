@@ -12,7 +12,7 @@ local R6_OFFSET = Vector3.new(0, 0.7, 0)
 
 -- KEYBINDS: fill with an Enum.KeyCode, or nil to disable
 local KEYBINDS = {
-    ToggleMinimize = Enum.KeyCode.L, -- show / hide window
+    ToggleMinimize = Enum.KeyCode.K, -- show / hide window
     Close = nil,                     -- stop the script completely
 }
 
