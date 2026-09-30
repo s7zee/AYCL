@@ -1,6 +1,10 @@
 local Players = game:GetService("Players")
 local InsertService = game:GetService("InsertService")
 local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
 local player = Players.LocalPlayer
 
 local KORBLOX_MESH = "rbxassetid://9598310133"
@@ -10,10 +14,70 @@ local KORBLOX_TEXTURE = "rbxassetid://902843398"
 local R15_OFFSET = Vector3.new(0, 0, 0)
 local R6_OFFSET = Vector3.new(0, 0.7, 0)
 
+-- Camera settings
+local SNAP_DISTANCE = 13    -- distance used by the one-time snap
+local HEIGHT_OFFSET = 1.5
+local FIELD_OF_VIEW = 50
+
+-- Emote save file (executor file functions)
+local SAVE_FILE = "EmoteSaves.json"
+
 -- KEYBINDS: fill with an Enum.KeyCode, or nil to disable
 local KEYBINDS = {
     ToggleMinimize = Enum.KeyCode.L, -- show / hide window
     Close = nil,                     -- stop the script completely
+    CameraSnap = Enum.KeyCode.C,     -- one-time camera snap
+    CameraLock = Enum.KeyCode.V,     -- camlock on / off
+}
+
+-- Window layout
+local WIN_W, WIN_H = 560, 380
+local HEADER_H = 64
+local SIDEBAR_W = 140
+
+-- Colors (change these to restyle the whole window)
+local THEME = {
+    Window = Color3.fromRGB(255, 255, 255),
+    Header = Color3.fromRGB(221, 221, 223),
+    Sidebar = Color3.fromRGB(236, 236, 236),
+    Border = Color3.fromRGB(170, 170, 170),
+    Text = Color3.fromRGB(30, 30, 30),
+    SubText = Color3.fromRGB(120, 120, 120),
+    Selected = Color3.fromRGB(208, 213, 224),
+    Field = Color3.fromRGB(242, 242, 242),
+    Accent = Color3.fromRGB(52, 199, 89),       -- switch ON
+    SwitchOff = Color3.fromRGB(200, 200, 204),  -- switch OFF
+    Primary = Color3.fromRGB(10, 132, 255),
+    Danger = Color3.fromRGB(215, 65, 60),
+}
+
+-- Categories (sidebar buttons / pages)
+local CAT_APPEARANCE = "Korblox & Headless"
+local CAT_CATALOG = "Catalog"
+local CAT_EMOTES = "Emotes"
+local CAT_CAMERA = "Camera"
+local CATEGORIES = { CAT_APPEARANCE, CAT_CATALOG, CAT_EMOTES, CAT_CAMERA }
+
+-- Everything the search bar can find. Add a line here when you add a function.
+local FUNCTIONS = {
+    { name = "Korblox", desc = "Korblox right leg", category = CAT_APPEARANCE,
+      keywords = "leg right r15 r6 limb" },
+    { name = "Headless", desc = "Hide head and face", category = CAT_APPEARANCE,
+      keywords = "head face horseman invisible" },
+    { name = "Catalog item ID", desc = "Equip accessories or clothing by asset ID", category = CAT_CATALOG,
+      keywords = "add hat limited item equip horns input accessory shirt pants tshirt clothes clothing" },
+    { name = "Equipped items", desc = "See and remove what your avatar wears", category = CAT_CATALOG,
+      keywords = "original worn current list thumbnail remove rescan" },
+    { name = "Remove all added", desc = "Clear every item you added", category = CAT_CATALOG,
+      keywords = "clear delete" },
+    { name = "Emote player", desc = "Play any animation by ID", category = CAT_EMOTES,
+      keywords = "animation dance play stop id link" },
+    { name = "Saved emotes", desc = "Save and replay your emotes", category = CAT_EMOTES,
+      keywords = "save list favorite name" },
+    { name = "Camera snap", desc = "Move the camera in front of your character", category = CAT_CAMERA,
+      keywords = "snap view zoom fov front" },
+    { name = "Camlock", desc = "Fixed camera that tracks your head", category = CAT_CAMERA,
+      keywords = "lock track head fixed look" },
 }
 
 local env = (getgenv and getgenv()) or _G
@@ -27,16 +91,148 @@ end
 local gui = nil
 local mainFrame = nil
 local listFrame = nil
-local entries = {}      -- equipped accessories (persist across respawns)
+local entries = {}      -- equipped items (catalog ones persist across respawns)
 local connections = {}  -- global connections
 local minimized = false
 local closed = false
+local orderCounter = 0
+
+-- Marks instances this script created, so they are not mistaken for original items
+local CLONE_ATTR = "LCClone"
+
+-- Clothing classes and the property that holds their texture
+local CLOTHING_PROP = {
+    Shirt = "ShirtTemplate",
+    Pants = "PantsTemplate",
+    ShirtGraphic = "Graphic",
+}
 
 -- Toggles (on by default)
 local korbloxOn = true
 local headlessOn = true
 local korbloxRevert = nil
 local headlessRevert = nil
+
+-- Emote state
+local savedEmotes = {}  -- { [name] = id }
+local animTrack = nil
+
+-- Camera state
+local camLocked = false
+local fixedCamPos = nil          -- captured when camlock turns on, never changes while locked
+local camLockSwitchSet = nil     -- lets the V key update the switch in the UI
+
+-- GUI helpers
+
+local function make(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do
+        inst[k] = v
+    end
+    if parent then
+        inst.Parent = parent
+    end
+    return inst
+end
+
+local function corner(inst, radius)
+    return make("UICorner", { CornerRadius = radius }, inst)
+end
+
+local function stroke(inst, color, thickness)
+    return make("UIStroke", {
+        Color = color,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, inst)
+end
+
+local function makeButton(parent, text, color, size, position)
+    local b = make("TextButton", {
+        Size = size,
+        Position = position or UDim2.new(),
+        BackgroundColor3 = color,
+        Text = text,
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(b, UDim.new(0, 6))
+    return b
+end
+
+local function makeInput(parent, placeholder, y)
+    local box = make("TextBox", {
+        Position = UDim2.new(0, 14, 0, y),
+        Size = UDim2.new(1, -28, 0, 30),
+        BackgroundColor3 = THEME.Field,
+        TextColor3 = THEME.Text,
+        PlaceholderText = placeholder,
+        PlaceholderColor3 = THEME.SubText,
+        Text = "",
+        ClearTextOnFocus = false,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(box, UDim.new(0, 6))
+    stroke(box, THEME.Border, 1)
+    return box
+end
+
+-- iOS-style switch at the right side of its parent row.
+-- Returns a function that sets the switch from code without firing onChange.
+local function createSwitch(parent, initial, onChange)
+    local state = initial
+    local onPos = UDim2.new(1, -20, 0.5, -9)
+    local offPos = UDim2.new(0, 2, 0.5, -9)
+    local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+    local track = make("TextButton", {
+        Position = UDim2.new(1, -52, 0.5, -11),
+        Size = UDim2.new(0, 40, 0, 22),
+        BackgroundColor3 = initial and THEME.Accent or THEME.SwitchOff,
+        AutoButtonColor = false,
+        Text = "",
+        BorderSizePixel = 0,
+    }, parent)
+    corner(track, UDim.new(1, 0))
+
+    local knob = make("Frame", {
+        Size = UDim2.new(0, 18, 0, 18),
+        Position = initial and onPos or offPos,
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, UDim.new(1, 0))
+
+    local function render()
+        TweenService:Create(track, info, {
+            BackgroundColor3 = state and THEME.Accent or THEME.SwitchOff,
+        }):Play()
+        TweenService:Create(knob, info, {
+            Position = state and onPos or offPos,
+        }):Play()
+    end
+
+    track.MouseButton1Click:Connect(function()
+        state = not state
+        render()
+        onChange(state)
+    end)
+
+    return function(newState)
+        if newState ~= state then
+            state = newState
+            render()
+        end
+    end
+end
+
+local function keyHint(keyCode)
+    return keyCode and ("  (" .. keyCode.Name .. ")") or ""
+end
 
 -- Finds the model that is actually drawn on screen.
 -- Evade keeps a full rig in Workspace.Rigs[PlayerName]; player.Character is an invisible stub.
@@ -232,9 +428,18 @@ local function applyHeadless(char)
     headlessRevert = applyHeadlessTo(char)
 end
 
--- Accessories by ID (templates are cached, clones are attached per character)
+-- Catalog items: accessories AND clothing (shirt / pants / t-shirt)
+-- Templates are cached, clones are attached per character.
 
-local function loadAccessories(id)
+local function isClothing(inst)
+    return CLOTHING_PROP[inst.ClassName] ~= nil
+end
+
+local function thumbUrl(id)
+    return "rbxthumb://type=Asset&id=" .. tostring(id) .. "&w=150&h=150&filters=circular"
+end
+
+local function loadItems(id)
     local ok, result = pcall(function()
         return game:GetObjects("rbxassetid://" .. id)
     end)
@@ -244,11 +449,11 @@ local function loadAccessories(id)
 
     local found = {}
     for _, obj in ipairs(result) do
-        if obj:IsA("Accessory") then
+        if obj:IsA("Accessory") or isClothing(obj) then
             table.insert(found, obj)
         else
             for _, d in ipairs(obj:GetDescendants()) do
-                if d:IsA("Accessory") then
+                if d:IsA("Accessory") or isClothing(d) then
                     table.insert(found, d)
                 end
             end
@@ -256,7 +461,7 @@ local function loadAccessories(id)
     end
 
     if #found == 0 then
-        return nil, "No accessory found in " .. id
+        return nil, "No accessory or clothing found in " .. id
     end
     return found
 end
@@ -302,33 +507,60 @@ local function weldAccessory(char, acc)
     return false
 end
 
--- Attach clones of an entry's accessories to the given character
+-- Puts back the original clothing textures that an entry blanked out
+local function restoreHidden(entry)
+    if not entry.hidden then return end
+    for _, h in ipairs(entry.hidden) do
+        pcall(function() h.inst[h.prop] = h.value end)
+    end
+    entry.hidden = {}
+end
+
+-- Attach clones of an entry's items to the given character
 local function equipEntry(entry, char, hum)
     -- remove clones from a previous character/equip
     for _, acc in ipairs(entry.live) do
         pcall(function() acc:Destroy() end)
     end
     table.clear(entry.live)
+    restoreHidden(entry)
+    entry.hidden = {}
 
     for _, template in ipairs(entry.templates) do
         local acc = template:Clone()
         acc.Parent = nil
+        acc:SetAttribute(CLONE_ATTR, true)
 
-        -- Try the normal route first. AddAccessory can fail without throwing
-        -- (e.g. "Humanoid is not a valid character"), so check the parent afterwards.
-        if hum then
-            pcall(function() hum:AddAccessory(acc) end)
-        end
-        if acc.Parent ~= char then
+        if isClothing(acc) then
+            -- Only one of each clothing type renders, so blank the original ones
+            local prop = CLOTHING_PROP[acc.ClassName]
+            for _, other in ipairs(char:GetChildren()) do
+                if other.ClassName == acc.ClassName and not other:GetAttribute(CLONE_ATTR) then
+                    local old = other[prop]
+                    if old ~= "" then
+                        table.insert(entry.hidden, { inst = other, prop = prop, value = old })
+                        other[prop] = ""
+                    end
+                end
+            end
             acc.Parent = char
-        end
+        else
+            -- Try the normal route first. AddAccessory can fail without throwing
+            -- (e.g. "Humanoid is not a valid character"), so check the parent afterwards.
+            if hum then
+                pcall(function() hum:AddAccessory(acc) end)
+            end
+            if acc.Parent ~= char then
+                acc.Parent = char
+            end
 
-        -- If the normal attach didn't create a weld, do it by hand
-        local handle = acc:FindFirstChild("Handle")
-        if handle
-            and not handle:FindFirstChildWhichIsA("Weld")
-            and not handle:FindFirstChildWhichIsA("WeldConstraint") then
-            weldAccessory(char, acc)
+            -- If the normal attach didn't create a weld, do it by hand
+            local handle = acc:FindFirstChild("Handle")
+            if handle
+                and not handle:FindFirstChildWhichIsA("Weld")
+                and not handle:FindFirstChildWhichIsA("WeldConstraint") then
+                weldAccessory(char, acc)
+            end
         end
 
         table.insert(entry.live, acc)
@@ -339,6 +571,9 @@ local function removeEntry(entry)
     if entry.removed then return end
     entry.removed = true
 
+    restoreHidden(entry)
+
+    -- For original items, "live" holds the game's own instances, so this removes them locally
     for _, acc in ipairs(entry.live) do
         pcall(function() acc:Destroy() end)
     end
@@ -355,44 +590,81 @@ local function removeEntry(entry)
     end
 end
 
-local function removeAllAccessories()
+-- Removes only items added through the catalog (original items are left alone)
+local function removeAllAdded()
     for i = #entries, 1, -1 do
-        removeEntry(entries[i])
+        local e = entries[i]
+        if e and e.kind == "catalog" then
+            removeEntry(e)
+        end
     end
 end
 
 local function createRow(entry)
     if not listFrame then return end
 
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -6, 0, 24)
-    row.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    row.BorderSizePixel = 0
-    row.Parent = listFrame
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+    orderCounter += 1
+    local row = make("Frame", {
+        Size = UDim2.new(1, -6, 0, 40),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        LayoutOrder = (entry.kind == "original" and 0 or 100000) + orderCounter,
+    }, listFrame)
+    corner(row, UDim.new(0, 5))
+    stroke(row, Color3.fromRGB(215, 215, 215), 1)
 
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -34, 1, 0)
-    label.Position = UDim2.new(0, 8, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = entry.id .. "  " .. entry.name
-    label.TextColor3 = Color3.new(1, 1, 1)
-    label.Font = Enum.Font.Gotham
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextTruncate = Enum.TextTruncate.AtEnd
-    label.Parent = row
+    -- Thumbnail
+    local thumb = make("ImageLabel", {
+        Position = UDim2.new(0, 4, 0.5, -16),
+        Size = UDim2.new(0, 32, 0, 32),
+        BackgroundColor3 = THEME.Field,
+        BorderSizePixel = 0,
+        Image = entry.thumbId and thumbUrl(entry.thumbId) or "",
+        ScaleType = Enum.ScaleType.Fit,
+    }, row)
+    corner(thumb, UDim.new(0, 5))
 
-    local xBtn = Instance.new("TextButton")
-    xBtn.Size = UDim2.new(0, 22, 0, 18)
-    xBtn.Position = UDim2.new(1, -26, 0.5, -9)
-    xBtn.BackgroundColor3 = Color3.fromRGB(150, 60, 60)
-    xBtn.Text = "X"
-    xBtn.TextColor3 = Color3.new(1, 1, 1)
-    xBtn.Font = Enum.Font.GothamBold
-    xBtn.TextSize = 12
-    xBtn.Parent = row
-    Instance.new("UICorner", xBtn).CornerRadius = UDim.new(0, 4)
+    make("TextLabel", {
+        Size = UDim2.new(1, -78, 0, 18),
+        Position = UDim2.new(0, 44, 0, 4),
+        BackgroundTransparency = 1,
+        Text = entry.name,
+        TextColor3 = THEME.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local sub
+    if entry.kind == "original" then
+        sub = "Original  ·  " .. entry.className
+    else
+        sub = "ID " .. tostring(entry.id) .. "  ·  " .. entry.className
+    end
+    make("TextLabel", {
+        Size = UDim2.new(1, -78, 0, 14),
+        Position = UDim2.new(0, 44, 0, 22),
+        BackgroundTransparency = 1,
+        Text = sub,
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local xBtn = make("TextButton", {
+        Size = UDim2.new(0, 22, 0, 18),
+        Position = UDim2.new(1, -28, 0.5, -9),
+        BackgroundColor3 = THEME.Danger,
+        Text = "X",
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        BorderSizePixel = 0,
+    }, row)
+    corner(xBtn, UDim.new(0, 4))
 
     xBtn.MouseButton1Click:Connect(function()
         removeEntry(entry)
@@ -401,7 +673,63 @@ local function createRow(entry)
     entry.row = row
 end
 
-local function addAccessoryById(id)
+-- Best-effort asset id for the thumbnail of something the game equipped.
+local function firstId(value)
+    return value and tostring(value):match("%d+") or nil
+end
+
+local function originalThumbId(inst)
+    if isClothing(inst) then
+        return firstId(inst[CLOTHING_PROP[inst.ClassName]])
+    end
+
+    local handle = inst:FindFirstChild("Handle")
+    if handle then
+        if handle:IsA("MeshPart") and handle.MeshId ~= "" then
+            return firstId(handle.MeshId)
+        end
+        local sm = handle:FindFirstChildOfClass("SpecialMesh")
+        if sm and sm.MeshId ~= "" then
+            return firstId(sm.MeshId)
+        end
+    end
+    return nil
+end
+
+-- Finds what the rig was already wearing and lists it so it can be removed
+local function scanOriginals(char)
+    -- forget the previous scan (rows only; the instances belong to the game)
+    for i = #entries, 1, -1 do
+        if entries[i].kind == "original" then
+            local e = table.remove(entries, i)
+            e.removed = true
+            if e.row then e.row:Destroy() end
+        end
+    end
+    if not char then return 0 end
+
+    local count = 0
+    for _, child in ipairs(char:GetChildren()) do
+        if not child:GetAttribute(CLONE_ATTR)
+            and (child:IsA("Accessory") or isClothing(child)) then
+            local entry = {
+                kind = "original",
+                name = child.Name,
+                className = child.ClassName,
+                templates = {},
+                live = { child },
+                thumbId = originalThumbId(child),
+                removed = false,
+            }
+            table.insert(entries, entry)
+            createRow(entry)
+            count += 1
+        end
+    end
+    return count
+end
+
+local function addItemById(id)
     local char = getVisualChar()
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not char then
@@ -409,12 +737,12 @@ local function addAccessoryById(id)
     end
 
     for _, e in ipairs(entries) do
-        if e.id == id then
+        if e.kind == "catalog" and e.id == id then
             return false, id .. " is already equipped"
         end
     end
 
-    local templates, err = loadAccessories(id)
+    local templates, err = loadItems(id)
     if not templates then
         return false, err
     end
@@ -423,11 +751,43 @@ local function addAccessoryById(id)
         t.Parent = nil
     end
 
+    -- Like a real avatar: a new shirt/pants/t-shirt replaces the previous added one
+    local classes = {}
+    for _, t in ipairs(templates) do
+        if isClothing(t) then
+            classes[t.ClassName] = true
+        end
+    end
+    for i = #entries, 1, -1 do
+        local e = entries[i]
+        if e and e.kind == "catalog" then
+            for _, t in ipairs(e.templates) do
+                if classes[t.ClassName] then
+                    removeEntry(e)
+                    break
+                end
+            end
+        end
+    end
+
+    -- Nice display name from the catalog, falling back to the object's name
+    local name = templates[1].Name
+    local okInfo, info = pcall(function()
+        return MarketplaceService:GetProductInfo(tonumber(id))
+    end)
+    if okInfo and info and info.Name then
+        name = info.Name
+    end
+
     local entry = {
+        kind = "catalog",
         id = id,
-        name = templates[1].Name,
+        name = name,
+        className = templates[1].ClassName,
         templates = templates,
         live = {},
+        hidden = {},
+        thumbId = id,
         removed = false,
     }
 
@@ -435,6 +795,192 @@ local function addAccessoryById(id)
     equipEntry(entry, char, hum)
     createRow(entry)
     return true, "Added " .. id
+end
+
+-- Emotes (saved to a file, played on the visible rig)
+
+local function loadSavedEmotes()
+    local ok, result = pcall(function()
+        if isfile and isfile(SAVE_FILE) then
+            return HttpService:JSONDecode(readfile(SAVE_FILE))
+        end
+        return {}
+    end)
+    savedEmotes = (ok and type(result) == "table") and result or {}
+end
+
+local function persistSavedEmotes()
+    pcall(function()
+        if writefile then
+            writefile(SAVE_FILE, HttpService:JSONEncode(savedEmotes))
+        end
+    end)
+end
+
+local function getAnimator(char)
+    if not char then return nil end
+
+    local controller = char:FindFirstChildOfClass("Humanoid")
+        or char:FindFirstChildOfClass("AnimationController")
+    if not controller then
+        controller = Instance.new("AnimationController")
+        controller.Parent = char
+    end
+
+    local animator = controller:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = controller
+    end
+    return animator
+end
+
+local function stopEmote()
+    if animTrack then
+        pcall(function() animTrack:Stop() end)
+        animTrack = nil
+    end
+end
+
+local function playEmote(id)
+    stopEmote()
+
+    local animator = getAnimator(getVisualChar())
+    if not animator then
+        return false, "No rig found"
+    end
+
+    local animation = Instance.new("Animation")
+    animation.AnimationId = "rbxassetid://" .. id
+
+    local ok, track = pcall(function()
+        return animator:LoadAnimation(animation)
+    end)
+
+    if ok and track then
+        animTrack = track
+        animTrack.Looped = true
+        animTrack:Play()
+        return true
+    end
+
+    warn("[LocalCosmetics] Failed to load animation: " .. tostring(track))
+    return false, "Could not load animation (wrong ID or private asset)"
+end
+
+-- Auto-stop: polls every frame, since Running/Jumping state changes
+-- can fail to fire reliably in some games. Uses the real character's
+-- Humanoid because that is what reacts to your input.
+table.insert(connections, RunService.Heartbeat:Connect(function()
+    if not animTrack then return end
+
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local state = hum:GetState()
+    if hum.MoveDirection.Magnitude > 0
+        or state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.Freefall
+        or state == Enum.HumanoidStateType.Swimming then
+        stopEmote()
+    end
+end))
+
+loadSavedEmotes()
+
+-- Camera
+
+local function getCamera()
+    return workspace.CurrentCamera
+end
+
+-- One-time snap: puts the camera in front of the character
+local function snapCamera()
+    local camera = getCamera()
+    local character = player.Character
+    if not (camera and character) then return end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local charCFrame = hrp.CFrame
+    local camPos = charCFrame.Position
+        + charCFrame.LookVector * SNAP_DISTANCE
+        + Vector3.new(0, HEIGHT_OFFSET, 0)
+    local lookAt = charCFrame.Position + Vector3.new(0, HEIGHT_OFFSET, 0)
+
+    camera.CameraType = Enum.CameraType.Scriptable
+    camera.FieldOfView = FIELD_OF_VIEW
+    camera.CFrame = CFrame.new(camPos, lookAt)
+
+    camera.CameraType = Enum.CameraType.Custom
+    camera.FieldOfView = FIELD_OF_VIEW
+
+    player.CameraMinZoomDistance = SNAP_DISTANCE
+    player.CameraMaxZoomDistance = SNAP_DISTANCE
+    task.defer(function()
+        player.CameraMinZoomDistance = 0.5
+        player.CameraMaxZoomDistance = 400
+    end)
+end
+
+-- Camlock: fixed position, only the look direction follows your head
+local function enableCamLock()
+    if camLocked then return end
+
+    local camera = getCamera()
+    local character = player.Character
+    if not (camera and character) then return end
+    if not character:FindFirstChild("Head") then return end
+
+    camLocked = true
+
+    -- Camera position is captured once and never changes while locked
+    fixedCamPos = camera.CFrame.Position
+
+    camera.CameraType = Enum.CameraType.Scriptable
+    camera.FieldOfView = FIELD_OF_VIEW
+
+    pcall(function() RunService:UnbindFromRenderStep("LocalCosmeticsCamLock") end)
+    RunService:BindToRenderStep("LocalCosmeticsCamLock", Enum.RenderPriority.Camera.Value, function()
+        local cam = getCamera()
+        local char = player.Character
+        local h = char and char:FindFirstChild("Head")
+        if not (cam and h and fixedCamPos) then return end
+
+        cam.CFrame = CFrame.new(fixedCamPos, h.Position)
+    end)
+end
+
+local function disableCamLock()
+    if not camLocked then return end
+    camLocked = false
+    pcall(function() RunService:UnbindFromRenderStep("LocalCosmeticsCamLock") end)
+    fixedCamPos = nil
+
+    local camera = getCamera()
+    if camera then
+        camera.CameraType = Enum.CameraType.Custom
+        camera.FieldOfView = FIELD_OF_VIEW
+    end
+
+    player.CameraMinZoomDistance = 0.5
+    player.CameraMaxZoomDistance = 400
+end
+
+local function syncCamSwitch()
+    if camLockSwitchSet then
+        camLockSwitchSet(camLocked)
+    end
+end
+
+local function toggleCamLock()
+    if camLocked then
+        disableCamLock()
+    else
+        enableCamLock()
+    end
+    syncCamSwitch()
 end
 
 -- Window controls
@@ -446,14 +992,17 @@ local function setMinimized(state)
     end
 end
 
--- Stops the script completely: removes effects, accessories, keybinds and GUI
+-- Stops the script completely: removes effects, added items, emote, camera, keybinds and GUI
 local function closeScript()
     if closed then return end
     closed = true
 
     removeKorblox()
     removeHeadless()
-    removeAllAccessories()
+    removeAllAdded() -- also restores any original clothing that was blanked
+    stopEmote()
+    camLockSwitchSet = nil
+    disableCamLock()
 
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
@@ -484,171 +1033,356 @@ local function destroyOldGui()
     end
 end
 
-local ON_COLOR = Color3.fromRGB(60, 140, 80)
-local OFF_COLOR = Color3.fromRGB(80, 80, 80)
-
-local function styleToggle(btn, name, on)
-    btn.Text = name .. ": " .. (on and "ON" or "OFF")
-    btn.BackgroundColor3 = on and ON_COLOR or OFF_COLOR
-end
-
 local function buildGui()
     destroyOldGui()
 
     local parent = (gethui and gethui()) or player:WaitForChild("PlayerGui")
 
-    gui = Instance.new("ScreenGui")
-    gui.Name = "LocalCosmetics"
-    gui.ResetOnSpawn = false
-    gui.Parent = parent
+    gui = make("ScreenGui", { Name = "LocalCosmetics", ResetOnSpawn = false }, parent)
 
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 260, 0, 300)
-    frame.Position = UDim2.new(0, 20, 0.5, -150)
-    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = gui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    -- Window
+    local frame = make("Frame", {
+        Size = UDim2.new(0, WIN_W, 0, WIN_H),
+        Position = UDim2.new(0.5, -WIN_W / 2, 0.5, -WIN_H / 2),
+        BackgroundColor3 = THEME.Window,
+        BorderSizePixel = 0,
+        Active = true,
+        Draggable = true,
+    }, gui)
+    corner(frame, UDim.new(0, 10))
+    stroke(frame, THEME.Border, 1)
     mainFrame = frame
 
-    -- Title bar
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -64, 0, 26)
-    title.Position = UDim2.new(0, 10, 0, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "Accessory IDs"
-    title.TextColor3 = Color3.new(1, 1, 1)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = frame
+    -- Header (title row + toolbar row)
+    local header = make("Frame", {
+        Size = UDim2.new(1, 0, 0, HEADER_H),
+        BackgroundColor3 = THEME.Header,
+        BorderSizePixel = 0,
+    }, frame)
+    corner(header, UDim.new(0, 10))
+    make("Frame", { -- square off the bottom corners
+        Position = UDim2.new(0, 0, 1, -10),
+        Size = UDim2.new(1, 0, 0, 10),
+        BackgroundColor3 = THEME.Header,
+        BorderSizePixel = 0,
+    }, header)
+    make("Frame", { -- bottom border line
+        Position = UDim2.new(0, 0, 1, -1),
+        Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = THEME.Border,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, header)
 
-    local minBtn = Instance.new("TextButton")
-    minBtn.Size = UDim2.new(0, 22, 0, 18)
-    minBtn.Position = UDim2.new(1, -52, 0, 4)
-    minBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-    minBtn.Text = "–"
-    minBtn.TextColor3 = Color3.new(1, 1, 1)
-    minBtn.Font = Enum.Font.GothamBold
-    minBtn.TextSize = 14
-    minBtn.Parent = frame
-    Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 4)
+    make("TextLabel", {
+        Position = UDim2.new(0, 0, 0, 6),
+        Size = UDim2.new(1, 0, 0, 14),
+        BackgroundTransparency = 1,
+        Text = "ALL YOU CAN LARP by Syzee",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+    }, header)
 
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.new(0, 22, 0, 18)
-    closeBtn.Position = UDim2.new(1, -26, 0, 4)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(170, 60, 60)
-    closeBtn.Text = "X"
-    closeBtn.TextColor3 = Color3.new(1, 1, 1)
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.TextSize = 12
-    closeBtn.Parent = frame
-    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+    -- Traffic lights: red = close, yellow = minimize, green = decoration only
+    local function light(x, color, edge)
+        local b = make("TextButton", {
+            Position = UDim2.new(0, x, 0, 8),
+            Size = UDim2.new(0, 13, 0, 13),
+            BackgroundColor3 = color,
+            AutoButtonColor = false,
+            Text = "",
+            TextColor3 = edge,
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            BorderSizePixel = 0,
+            ZIndex = 3,
+        }, header)
+        corner(b, UDim.new(1, 0))
+        stroke(b, edge, 1)
+        return b
+    end
 
+    local closeBtn = light(12, Color3.fromRGB(237, 106, 94), Color3.fromRGB(190, 70, 60))
+    local minBtn = light(32, Color3.fromRGB(245, 191, 79), Color3.fromRGB(200, 150, 40))
+    local zoomBtn = light(52, Color3.fromRGB(97, 197, 84), Color3.fromRGB(70, 150, 60))
+
+    local function setGlyphs(show)
+        closeBtn.Text = show and "×" or ""
+        minBtn.Text = show and "–" or ""
+    end
+    for _, b in ipairs({ closeBtn, minBtn, zoomBtn }) do
+        b.MouseEnter:Connect(function() setGlyphs(true) end)
+        b.MouseLeave:Connect(function() setGlyphs(false) end)
+    end
+
+    closeBtn.MouseButton1Click:Connect(closeScript)
     minBtn.MouseButton1Click:Connect(function()
         setMinimized(true)
     end)
-    closeBtn.MouseButton1Click:Connect(closeScript)
+    -- zoomBtn: intentionally does nothing
 
-    -- Input
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.new(1, -20, 0, 30)
-    box.Position = UDim2.new(0, 10, 0, 30)
-    box.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    box.TextColor3 = Color3.new(1, 1, 1)
-    box.PlaceholderText = "ID, ID, ID..."
-    box.Text = ""
-    box.ClearTextOnFocus = false
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 13
-    box.Parent = frame
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    -- Back / forward (move through the categories you visited)
+    local nav = make("Frame", {
+        Position = UDim2.new(0, 12, 0, 30),
+        Size = UDim2.new(0, 52, 0, 26),
+        BackgroundColor3 = Color3.fromRGB(240, 240, 240),
+        BorderSizePixel = 0,
+    }, header)
+    corner(nav, UDim.new(0, 6))
+    stroke(nav, THEME.Border, 1)
 
-    local addBtn = Instance.new("TextButton")
-    addBtn.Size = UDim2.new(0.5, -15, 0, 28)
-    addBtn.Position = UDim2.new(0, 10, 0, 68)
-    addBtn.BackgroundColor3 = Color3.fromRGB(60, 140, 80)
-    addBtn.Text = "Add"
-    addBtn.TextColor3 = Color3.new(1, 1, 1)
-    addBtn.Font = Enum.Font.GothamBold
-    addBtn.TextSize = 13
-    addBtn.Parent = frame
-    Instance.new("UICorner", addBtn).CornerRadius = UDim.new(0, 6)
+    local backBtn = make("TextButton", {
+        Size = UDim2.new(0.5, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "<",
+        TextColor3 = THEME.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+    }, nav)
+    local fwdBtn = make("TextButton", {
+        Position = UDim2.new(0.5, 0, 0, 0),
+        Size = UDim2.new(0.5, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = ">",
+        TextColor3 = THEME.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+    }, nav)
+    make("Frame", {
+        Position = UDim2.new(0.5, 0, 0, 3),
+        Size = UDim2.new(0, 1, 1, -6),
+        BackgroundColor3 = THEME.Border,
+        BorderSizePixel = 0,
+    }, nav)
 
-    local clearBtn = Instance.new("TextButton")
-    clearBtn.Size = UDim2.new(0.5, -15, 0, 28)
-    clearBtn.Position = UDim2.new(0.5, 5, 0, 68)
-    clearBtn.BackgroundColor3 = Color3.fromRGB(150, 60, 60)
-    clearBtn.Text = "Remove all"
-    clearBtn.TextColor3 = Color3.new(1, 1, 1)
-    clearBtn.Font = Enum.Font.GothamBold
-    clearBtn.TextSize = 13
-    clearBtn.Parent = frame
-    Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 6)
+    -- Search bar
+    local search = make("Frame", {
+        Position = UDim2.new(0, SIDEBAR_W, 0, 30),
+        Size = UDim2.new(1, -SIDEBAR_W - 12, 0, 26),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, header)
+    corner(search, UDim.new(1, 0))
+    stroke(search, THEME.Border, 1)
 
-    -- Korblox / Headless toggles
-    local korbloxBtn = Instance.new("TextButton")
-    korbloxBtn.Size = UDim2.new(0.5, -15, 0, 28)
-    korbloxBtn.Position = UDim2.new(0, 10, 0, 102)
-    korbloxBtn.TextColor3 = Color3.new(1, 1, 1)
-    korbloxBtn.Font = Enum.Font.GothamBold
-    korbloxBtn.TextSize = 12
-    korbloxBtn.Parent = frame
-    Instance.new("UICorner", korbloxBtn).CornerRadius = UDim.new(0, 6)
-    styleToggle(korbloxBtn, "Korblox", korbloxOn)
+    local icon = make("Frame", { -- magnifier circle
+        Position = UDim2.new(0, 10, 0.5, -6),
+        Size = UDim2.new(0, 10, 0, 10),
+        BackgroundTransparency = 1,
+    }, search)
+    corner(icon, UDim.new(1, 0))
+    stroke(icon, THEME.SubText, 1.5)
+    make("Frame", { -- magnifier handle
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 22, 0, 19),
+        Size = UDim2.new(0, 6, 0, 2),
+        Rotation = 45,
+        BackgroundColor3 = THEME.SubText,
+        BorderSizePixel = 0,
+    }, search)
 
-    local headlessBtn = Instance.new("TextButton")
-    headlessBtn.Size = UDim2.new(0.5, -15, 0, 28)
-    headlessBtn.Position = UDim2.new(0.5, 5, 0, 102)
-    headlessBtn.TextColor3 = Color3.new(1, 1, 1)
-    headlessBtn.Font = Enum.Font.GothamBold
-    headlessBtn.TextSize = 12
-    headlessBtn.Parent = frame
-    Instance.new("UICorner", headlessBtn).CornerRadius = UDim.new(0, 6)
-    styleToggle(headlessBtn, "Headless", headlessOn)
+    local searchBox = make("TextBox", {
+        Position = UDim2.new(0, 32, 0, 0),
+        Size = UDim2.new(1, -42, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+        PlaceholderText = "Search. . .",
+        PlaceholderColor3 = THEME.SubText,
+        TextColor3 = THEME.Text,
+        ClearTextOnFocus = false,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, search)
 
-    local status = Instance.new("TextLabel")
-    status.Size = UDim2.new(1, -20, 0, 22)
-    status.Position = UDim2.new(0, 10, 0, 134)
-    status.BackgroundTransparency = 1
-    status.Text = ""
-    status.TextColor3 = Color3.fromRGB(200, 200, 200)
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 12
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.TextTruncate = Enum.TextTruncate.AtEnd
-    status.Parent = frame
+    -- Sidebar
+    local sidebar = make("Frame", {
+        Position = UDim2.new(0, 0, 0, HEADER_H),
+        Size = UDim2.new(0, SIDEBAR_W, 1, -HEADER_H),
+        BackgroundColor3 = THEME.Sidebar,
+        BorderSizePixel = 0,
+    }, frame)
+    corner(sidebar, UDim.new(0, 10))
+    make("Frame", { -- square off the top corners
+        Size = UDim2.new(1, 0, 0, 10),
+        BackgroundColor3 = THEME.Sidebar,
+        BorderSizePixel = 0,
+    }, sidebar)
+    make("Frame", { -- square off the right corners
+        Position = UDim2.new(1, -10, 0, 0),
+        Size = UDim2.new(0, 10, 1, 0),
+        BackgroundColor3 = THEME.Sidebar,
+        BorderSizePixel = 0,
+    }, sidebar)
+    make("Frame", { -- divider between sidebar and page
+        Position = UDim2.new(0, SIDEBAR_W, 0, HEADER_H),
+        Size = UDim2.new(0, 1, 1, -HEADER_H),
+        BackgroundColor3 = THEME.Border,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, frame)
 
-    -- Equipped list (bottom of the popup)
-    listFrame = Instance.new("ScrollingFrame")
-    listFrame.Size = UDim2.new(1, -20, 0, 132)
-    listFrame.Position = UDim2.new(0, 10, 0, 160)
-    listFrame.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
-    listFrame.BorderSizePixel = 0
-    listFrame.ScrollBarThickness = 4
-    listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    listFrame.Parent = frame
-    Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 6)
+    -- Main page area
+    local content = make("Frame", {
+        Position = UDim2.new(0, SIDEBAR_W + 1, 0, HEADER_H),
+        Size = UDim2.new(1, -SIDEBAR_W - 1, 1, -HEADER_H),
+        BackgroundTransparency = 1,
+    }, frame)
 
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 4)
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Parent = listFrame
+    local pages = {}
+    local sideButtons = {}
 
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop = UDim.new(0, 4)
-    pad.PaddingLeft = UDim.new(0, 4)
-    pad.PaddingBottom = UDim.new(0, 4)
-    pad.Parent = listFrame
+    local function newPage(name)
+        local p = make("Frame", {
+            Name = name,
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Visible = false,
+        }, content)
+        make("TextLabel", {
+            Position = UDim2.new(0, 14, 0, 10),
+            Size = UDim2.new(1, -28, 0, 22),
+            BackgroundTransparency = 1,
+            Text = name,
+            TextColor3 = THEME.Text,
+            Font = Enum.Font.GothamBold,
+            TextSize = 16,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, p)
+        return p
+    end
+
+    -- A function row: name + description on the left, control added on the right
+    local function addRow(page, y, name, desc)
+        local row = make("Frame", {
+            Position = UDim2.new(0, 14, 0, y),
+            Size = UDim2.new(1, -28, 0, 48),
+            BackgroundColor3 = THEME.Field,
+            BorderSizePixel = 0,
+        }, page)
+        corner(row, UDim.new(0, 8))
+        make("TextLabel", {
+            Position = UDim2.new(0, 12, 0, 6),
+            Size = UDim2.new(1, -92, 0, 18),
+            BackgroundTransparency = 1,
+            Text = name,
+            TextColor3 = THEME.Text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        make("TextLabel", {
+            Position = UDim2.new(0, 12, 0, 25),
+            Size = UDim2.new(1, -92, 0, 16),
+            BackgroundTransparency = 1,
+            Text = desc,
+            TextColor3 = THEME.SubText,
+            Font = Enum.Font.Gotham,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+        return row
+    end
+
+    local function addSwitchRow(page, y, name, desc, initial, onChange)
+        local row = addRow(page, y, name, desc)
+        return createSwitch(row, initial, onChange)
+    end
+
+    ---------------------------------------------------------------- Page: Korblox & Headless
+    local appearancePage = newPage(CAT_APPEARANCE)
+    pages[CAT_APPEARANCE] = appearancePage
+
+    addSwitchRow(appearancePage, 44, "Korblox", "Korblox right leg", korbloxOn, function(on)
+        korbloxOn = on
+        if on then
+            applyKorblox(getVisualChar())
+        else
+            removeKorblox()
+        end
+    end)
+
+    addSwitchRow(appearancePage, 100, "Headless", "Hide head and face", headlessOn, function(on)
+        headlessOn = on
+        if on then
+            applyHeadless(getVisualChar())
+        else
+            removeHeadless()
+        end
+    end)
+
+    ---------------------------------------------------------------- Page: Catalog
+    local catalogPage = newPage(CAT_CATALOG)
+    pages[CAT_CATALOG] = catalogPage
+
+    local box = makeInput(catalogPage, "Item ID, ID, ID... (accessory or clothing)", 40)
+
+    local catBtnRow = make("Frame", {
+        Position = UDim2.new(0, 14, 0, 78),
+        Size = UDim2.new(1, -28, 0, 28),
+        BackgroundTransparency = 1,
+    }, catalogPage)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, catBtnRow)
+
+    local addBtn = makeButton(catBtnRow, "Add", THEME.Primary, UDim2.new(1 / 3, -4, 1, 0))
+    addBtn.LayoutOrder = 1
+    local clearBtn = makeButton(catBtnRow, "Remove added", THEME.Danger, UDim2.new(1 / 3, -4, 1, 0))
+    clearBtn.LayoutOrder = 2
+    local rescanBtn = makeButton(catBtnRow, "Rescan", THEME.SubText, UDim2.new(1 / 3, -4, 1, 0))
+    rescanBtn.LayoutOrder = 3
+
+    local status = make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 112),
+        Size = UDim2.new(1, -28, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, catalogPage)
+
+    -- Equipped list (bottom of the page): original items first, then added ones
+    listFrame = make("ScrollingFrame", {
+        Position = UDim2.new(0, 14, 0, 134),
+        Size = UDim2.new(1, -28, 1, -146),
+        BackgroundColor3 = Color3.fromRGB(246, 246, 246),
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, catalogPage)
+    corner(listFrame, UDim.new(0, 6))
+    stroke(listFrame, Color3.fromRGB(215, 215, 215), 1)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, listFrame)
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 4),
+        PaddingLeft = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 4),
+    }, listFrame)
+
+    -- Rows created before the GUI existed (setup can finish first) get drawn now
+    for _, e in ipairs(entries) do
+        if not e.row then createRow(e) end
+    end
 
     addBtn.MouseButton1Click:Connect(function()
+        status.Text = "Loading..."
         local added, failed, lastErr, any = 0, 0, nil, false
-        for id in string.gmatch(box.Text, "%d+") do
+        local text = box.Text
+        for id in string.gmatch(text, "%d+") do
             any = true
-            local ok, msg = addAccessoryById(id)
+            local ok, msg = addItemById(id)
             if ok then
                 added += 1
             else
@@ -658,7 +1392,7 @@ local function buildGui()
         end
 
         if not any then
-            status.Text = "Enter an accessory ID"
+            status.Text = "Enter an item ID"
         elseif failed > 0 then
             status.Text = ("Added %d, failed %d: %s"):format(added, failed, lastErr)
         else
@@ -668,29 +1402,373 @@ local function buildGui()
     end)
 
     clearBtn.MouseButton1Click:Connect(function()
-        removeAllAccessories()
-        status.Text = "Removed all accessories"
+        removeAllAdded()
+        status.Text = "Removed all added items"
     end)
 
-    korbloxBtn.MouseButton1Click:Connect(function()
-        korbloxOn = not korbloxOn
-        styleToggle(korbloxBtn, "Korblox", korbloxOn)
-        if korbloxOn then
-            applyKorblox(getVisualChar())
+    rescanBtn.MouseButton1Click:Connect(function()
+        local n = scanOriginals(getVisualChar())
+        status.Text = ("Found %d original items"):format(n)
+    end)
+
+    ---------------------------------------------------------------- Page: Emotes
+    local emotePage = newPage(CAT_EMOTES)
+    pages[CAT_EMOTES] = emotePage
+
+    local nameBox = makeInput(emotePage, "Emote Name", 40)
+    local idBox = makeInput(emotePage, "Emote ID / Link", 76)
+
+    local emoteBtnRow = make("Frame", {
+        Position = UDim2.new(0, 14, 0, 112),
+        Size = UDim2.new(1, -28, 0, 28),
+        BackgroundTransparency = 1,
+    }, emotePage)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, emoteBtnRow)
+
+    local playBtn = makeButton(emoteBtnRow, "Play", THEME.Accent, UDim2.new(1 / 3, -4, 1, 0))
+    playBtn.LayoutOrder = 1
+    local stopBtn = makeButton(emoteBtnRow, "Stop", THEME.Danger, UDim2.new(1 / 3, -4, 1, 0))
+    stopBtn.LayoutOrder = 2
+    local saveBtn = makeButton(emoteBtnRow, "Save", THEME.Primary, UDim2.new(1 / 3, -4, 1, 0))
+    saveBtn.LayoutOrder = 3
+
+    local emoteStatus = make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 144),
+        Size = UDim2.new(1, -28, 0, 16),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, emotePage)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 164),
+        Size = UDim2.new(1, -28, 0, 16),
+        BackgroundTransparency = 1,
+        Text = "Saved emotes",
+        TextColor3 = THEME.SubText,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, emotePage)
+
+    local emoteList = make("ScrollingFrame", {
+        Position = UDim2.new(0, 14, 0, 182),
+        Size = UDim2.new(1, -28, 1, -194),
+        BackgroundColor3 = Color3.fromRGB(246, 246, 246),
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, emotePage)
+    corner(emoteList, UDim.new(0, 6))
+    stroke(emoteList, Color3.fromRGB(215, 215, 215), 1)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, emoteList)
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 4),
+        PaddingLeft = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 4),
+    }, emoteList)
+
+    local function parseId(text)
+        -- first run of digits, so a pasted link or rbxassetid:// also works
+        return text:match("%d+")
+    end
+
+    local refreshEmoteList
+    refreshEmoteList = function()
+        for _, c in ipairs(emoteList:GetChildren()) do
+            if c:IsA("Frame") then
+                c:Destroy()
+            end
+        end
+
+        local names = {}
+        for n in pairs(savedEmotes) do
+            table.insert(names, n)
+        end
+        table.sort(names)
+
+        for i, n in ipairs(names) do
+            local id = savedEmotes[n]
+
+            local row = make("Frame", {
+                Size = UDim2.new(1, -6, 0, 26),
+                BackgroundColor3 = Color3.new(1, 1, 1),
+                BorderSizePixel = 0,
+                LayoutOrder = i,
+            }, emoteList)
+            corner(row, UDim.new(0, 5))
+            stroke(row, Color3.fromRGB(215, 215, 215), 1)
+
+            local nameBtn = make("TextButton", {
+                Size = UDim2.new(1, -34, 1, 0),
+                BackgroundTransparency = 1,
+                Text = n,
+                TextColor3 = THEME.Text,
+                Font = Enum.Font.Gotham,
+                TextSize = 12,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, row)
+            make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, nameBtn)
+
+            local xBtn = make("TextButton", {
+                Size = UDim2.new(0, 22, 0, 18),
+                Position = UDim2.new(1, -26, 0.5, -9),
+                BackgroundColor3 = THEME.Danger,
+                Text = "X",
+                TextColor3 = Color3.new(1, 1, 1),
+                Font = Enum.Font.GothamBold,
+                TextSize = 12,
+                BorderSizePixel = 0,
+            }, row)
+            corner(xBtn, UDim.new(0, 4))
+
+            nameBtn.MouseButton1Click:Connect(function()
+                nameBox.Text = n
+                idBox.Text = id
+                local ok, msg = playEmote(id)
+                emoteStatus.Text = ok and ("Playing " .. n) or msg
+            end)
+
+            xBtn.MouseButton1Click:Connect(function()
+                savedEmotes[n] = nil
+                persistSavedEmotes()
+                refreshEmoteList()
+                emoteStatus.Text = "Deleted " .. n
+            end)
+        end
+    end
+
+    refreshEmoteList()
+
+    playBtn.MouseButton1Click:Connect(function()
+        local id = parseId(idBox.Text)
+        if not id then
+            emoteStatus.Text = "Enter an emote ID"
+            return
+        end
+        local ok, msg = playEmote(id)
+        emoteStatus.Text = ok and "Playing" or msg
+    end)
+
+    stopBtn.MouseButton1Click:Connect(function()
+        stopEmote()
+        emoteStatus.Text = "Stopped"
+    end)
+
+    saveBtn.MouseButton1Click:Connect(function()
+        local n = nameBox.Text:match("^%s*(.-)%s*$")
+        local id = parseId(idBox.Text)
+        if n ~= "" and id then
+            savedEmotes[n] = id
+            persistSavedEmotes()
+            refreshEmoteList()
+            emoteStatus.Text = "Saved " .. n
         else
-            removeKorblox()
+            emoteStatus.Text = "Enter both a name and an emote ID"
         end
     end)
 
-    headlessBtn.MouseButton1Click:Connect(function()
-        headlessOn = not headlessOn
-        styleToggle(headlessBtn, "Headless", headlessOn)
-        if headlessOn then
-            applyHeadless(getVisualChar())
-        else
-            removeHeadless()
+    ---------------------------------------------------------------- Page: Camera
+    local cameraPage = newPage(CAT_CAMERA)
+    pages[CAT_CAMERA] = cameraPage
+
+    local snapRow = addRow(cameraPage, 44, "Camera snap",
+        "Move the camera in front of you" .. keyHint(KEYBINDS.CameraSnap))
+    local snapBtn = makeButton(snapRow, "Snap", THEME.Primary,
+        UDim2.new(0, 64, 0, 26), UDim2.new(1, -76, 0.5, -13))
+    snapBtn.MouseButton1Click:Connect(snapCamera)
+
+    camLockSwitchSet = addSwitchRow(cameraPage, 100, "Camlock",
+        "Fixed camera that tracks your head" .. keyHint(KEYBINDS.CameraLock),
+        camLocked, function(on)
+            if on then
+                enableCamLock()
+            else
+                disableCamLock()
+            end
+            syncCamSwitch() -- snaps the switch back if camlock could not start
+        end)
+
+    ---------------------------------------------------------------- Search results page
+    local resultsPage = newPage("Search results")
+    local resultsList = make("ScrollingFrame", {
+        Position = UDim2.new(0, 14, 0, 40),
+        Size = UDim2.new(1, -28, 1, -52),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, resultsPage)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, resultsList)
+
+    -- Navigation state
+    local currentCategory = CAT_APPEARANCE
+    local history = { CAT_APPEARANCE }
+    local histIndex = 1
+
+    local navigate -- forward declaration
+
+    local function refresh()
+        local query = searchBox.Text:match("^%s*(.-)%s*$"):lower()
+
+        if query == "" then
+            resultsPage.Visible = false
+            for name, p in pairs(pages) do
+                p.Visible = (name == currentCategory)
+            end
+            return
+        end
+
+        for _, p in pairs(pages) do
+            p.Visible = false
+        end
+        resultsPage.Visible = true
+
+        for _, c in ipairs(resultsList:GetChildren()) do
+            if c:IsA("GuiObject") then
+                c:Destroy()
+            end
+        end
+
+        local count = 0
+        for _, fn in ipairs(FUNCTIONS) do
+            local hay = (fn.name .. " " .. fn.desc .. " " .. fn.keywords .. " " .. fn.category):lower()
+            if hay:find(query, 1, true) then
+                count += 1
+
+                local btn = make("TextButton", {
+                    Size = UDim2.new(1, -6, 0, 40),
+                    BackgroundColor3 = THEME.Field,
+                    Text = "",
+                    BorderSizePixel = 0,
+                }, resultsList)
+                corner(btn, UDim.new(0, 8))
+
+                make("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 4),
+                    Size = UDim2.new(1, -24, 0, 18),
+                    BackgroundTransparency = 1,
+                    Text = fn.name,
+                    TextColor3 = THEME.Text,
+                    Font = Enum.Font.GothamMedium,
+                    TextSize = 13,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                }, btn)
+                make("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 21),
+                    Size = UDim2.new(1, -24, 0, 15),
+                    BackgroundTransparency = 1,
+                    Text = fn.desc .. "  ·  " .. fn.category,
+                    TextColor3 = THEME.SubText,
+                    Font = Enum.Font.Gotham,
+                    TextSize = 11,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                }, btn)
+
+                btn.MouseButton1Click:Connect(function()
+                    navigate(fn.category)
+                end)
+            end
+        end
+
+        if count == 0 then
+            make("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 30),
+                BackgroundTransparency = 1,
+                Text = "No matching functions",
+                TextColor3 = THEME.SubText,
+                Font = Enum.Font.Gotham,
+                TextSize = 12,
+            }, resultsList)
+        end
+    end
+
+    local function updateChrome()
+        for name, b in pairs(sideButtons) do
+            b.BackgroundTransparency = (name == currentCategory) and 0 or 1
+        end
+        backBtn.TextTransparency = histIndex > 1 and 0 or 0.6
+        fwdBtn.TextTransparency = histIndex < #history and 0 or 0.6
+    end
+
+    navigate = function(name, fromHistory)
+        currentCategory = name
+
+        if not fromHistory then
+            while #history > histIndex do
+                table.remove(history)
+            end
+            if history[histIndex] ~= name then
+                table.insert(history, name)
+                histIndex = #history
+            end
+        end
+
+        if searchBox.Text ~= "" then
+            searchBox.Text = "" -- also triggers refresh
+        end
+        refresh()
+        updateChrome()
+    end
+
+    -- Sidebar category buttons
+    for i, name in ipairs(CATEGORIES) do
+        local b = make("TextButton", {
+            Position = UDim2.new(0, 8, 0, 10 + (i - 1) * 32),
+            Size = UDim2.new(1, -16, 0, 28),
+            BackgroundColor3 = THEME.Selected,
+            BackgroundTransparency = 1,
+            AutoButtonColor = false,
+            Text = name,
+            TextColor3 = THEME.Text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            BorderSizePixel = 0,
+        }, sidebar)
+        corner(b, UDim.new(0, 6))
+        make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, b)
+
+        b.MouseButton1Click:Connect(function()
+            navigate(name)
+        end)
+        sideButtons[name] = b
+    end
+
+    backBtn.MouseButton1Click:Connect(function()
+        if histIndex > 1 then
+            histIndex -= 1
+            navigate(history[histIndex], true)
         end
     end)
+
+    fwdBtn.MouseButton1Click:Connect(function()
+        if histIndex < #history then
+            histIndex += 1
+            navigate(history[histIndex], true)
+        end
+    end)
+
+    searchBox:GetPropertyChangedSignal("Text"):Connect(refresh)
+
+    navigate(CAT_APPEARANCE, true)
 end
 
 -- Keybinds (ignored while typing in a TextBox)
@@ -698,10 +1776,15 @@ end
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
 
-    if KEYBINDS.ToggleMinimize and input.KeyCode == KEYBINDS.ToggleMinimize then
+    local key = input.KeyCode
+    if KEYBINDS.ToggleMinimize and key == KEYBINDS.ToggleMinimize then
         setMinimized(not minimized)
-    elseif KEYBINDS.Close and input.KeyCode == KEYBINDS.Close then
+    elseif KEYBINDS.Close and key == KEYBINDS.Close then
         closeScript()
+    elseif KEYBINDS.CameraSnap and key == KEYBINDS.CameraSnap then
+        snapCamera()
+    elseif KEYBINDS.CameraLock and key == KEYBINDS.CameraLock then
+        toggleCamLock()
     end
 end))
 
@@ -719,6 +1802,10 @@ local function setup(char)
     -- The old rig's parts are gone, so just forget the old undo functions
     korbloxRevert = nil
     headlessRevert = nil
+    animTrack = nil
+
+    -- List what the rig is already wearing BEFORE any catalog clones are added
+    scanOriginals(char)
 
     if korbloxOn then
         applyKorblox(char)
@@ -729,7 +1816,9 @@ local function setup(char)
 
     local hum = char:FindFirstChildOfClass("Humanoid")
     for _, entry in ipairs(entries) do
-        equipEntry(entry, char, hum)
+        if entry.kind == "catalog" then
+            equipEntry(entry, char, hum)
+        end
     end
 end
 
